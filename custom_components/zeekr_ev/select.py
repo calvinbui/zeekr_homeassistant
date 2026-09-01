@@ -7,6 +7,7 @@ from typing import Any
 from homeassistant.components.select import SelectEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -205,7 +206,9 @@ class ZeekrSeatSelect(CoordinatorEntity, SelectEntity):
             return
 
         level = OPTION_TO_LEVEL.get(option, 0)
-        duration = getattr(self.coordinator, "seat_duration", 15)
+        duration = self.coordinator.operation_durations.get(self.vin, {}).get(
+            "seat", 15
+        )
 
         command = "start"
         service_id = "ZAF"
@@ -228,15 +231,16 @@ class ZeekrSeatSelect(CoordinatorEntity, SelectEntity):
         setting["serviceParameters"] = params
 
         await self.coordinator.async_inc_invoke()
-        await self.hass.async_add_executor_job(
+        success = await self.hass.async_add_executor_job(
             vehicle.do_remote_control, command, service_id, setting
         )
+        if not success:
+            raise HomeAssistantError(f"Failed to set {self._attr_name} to {option}")
 
         # Optimistic update
         self._update_local_state_optimistically(level)
         self.async_write_ha_state()
 
-        # Trigger refresh (might revert if API is slow, but that's expected eventually)
         await self.coordinator.async_request_refresh()
 
     def _update_local_state_optimistically(self, level: int):

@@ -14,6 +14,7 @@ from homeassistant.components.climate import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfTemperature
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -100,7 +101,9 @@ class ZeekrClimate(CoordinatorEntity, ClimateEntity):
 
         if hvac_mode == HVACMode.HEAT_COOL:
             # Turn ON
-            duration = getattr(self.coordinator, "ac_duration", 15)
+            duration = self.coordinator.operation_durations.get(self.vin, {}).get(
+                "ac", 15
+            )
             setting = {
                 "serviceParameters": [
                     {
@@ -130,9 +133,11 @@ class ZeekrClimate(CoordinatorEntity, ClimateEntity):
 
         if setting:
             await self.coordinator.async_inc_invoke()
-            await self.hass.async_add_executor_job(
+            success = await self.hass.async_add_executor_job(
                 vehicle.do_remote_control, command, service_id, setting
             )
+            if not success:
+                raise HomeAssistantError(f"Failed to set climate mode to {hvac_mode}")
 
             # Optimistic update
             self._update_local_state_optimistically(hvac_mode)

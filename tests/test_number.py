@@ -1,7 +1,15 @@
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock, patch
 import pytest
-from custom_components.zeekr_ev.number import ZeekrChargingLimitNumber, ZeekrConfigNumber
+
+from custom_components.zeekr_ev.number import (
+    ZeekrChargingLimitNumber,
+    ZeekrConfigNumber,
+    _migrate_legacy_config_numbers,
+    async_setup_entry,
+)
+from custom_components.zeekr_ev.const import DOMAIN
 
 
 @pytest.fixture(autouse=True)
@@ -23,7 +31,7 @@ class MockCoordinator:
         self.data = {v.vin: {} for v in vehicles}
         self.async_inc_invoke = AsyncMock()
         self.async_request_refresh = AsyncMock()
-        self.seat_duration = 15
+        self.operation_durations = {}
 
     def get_vehicle_by_vin(self, vin):
         for v in self.vehicles:
@@ -158,26 +166,92 @@ async def test_charging_limit_step():
 
 @pytest.mark.asyncio
 async def test_config_number():
-    coordinator = MockCoordinator([])
-    coordinator.seat_duration = 10
+    vehicle = MockVehicle("VIN1")
+    coordinator = MockCoordinator([vehicle])
+    coordinator.operation_durations[vehicle.vin] = {"seat": 10}
 
     number_entity = ZeekrConfigNumber(
-        coordinator, "entry_id", "seat_op", "Seat Operation", "seat_duration"
+        coordinator,
+        vehicle.vin,
+        "seat_op",
+        "Seat Operation",
+        "seat",
+        15,
     )
     number_entity.hass = DummyHass()
     number_entity.async_write_ha_state = MagicMock()
 
     # Check initial value
     assert number_entity.native_value == 10
+    assert number_entity.native_min_value == 1
+    assert number_entity.native_max_value == 60
+    assert number_entity.device_info["identifiers"] == {("zeekr_ev", vehicle.vin)}
 
     # Set value
     await number_entity.async_set_native_value(5)
     assert number_entity.native_value == 5
-    assert coordinator.seat_duration == 5
+    assert coordinator.operation_durations[vehicle.vin]["seat"] == 5
     number_entity.async_write_ha_state.assert_called()
 
-    # Test async_added_to_hass with restoration
-    # Mocking async_get_last_number_data is hard because it's a mixin method
-    # But we can test that it calls super().async_added_to_hass()
-    # Since we can't easily mock the restore logic without full HA environment,
-    # we'll skip detailed restoration test but we covered the main logic logic.
+
+@pytest.mark.asyncio
+async def test_config_numbers_are_created_per_vehicle():
+    coordinator = MockCoordinator([MockVehicle("VIN2"), MockVehicle("VIN1")])
+    hass = DummyHass()
+    entry = SimpleNamespace(entry_id="test_entry")
+    hass.data = {DOMAIN: {entry.entry_id: coordinator}}
+    async_add_entities = MagicMock()
+
+    with patch(
+        "custom_components.zeekr_ev.number._migrate_legacy_config_numbers",
+        return_value={"seat": 12},
+    ) as migrate:
+        await async_setup_entry(hass, entry, async_add_entities)
+
+    migrate.assert_called_once_with(hass, entry.entry_id, "VIN1")
+    config_numbers = [
+        entity
+        for entity in async_add_entities.call_args.args[0]
+        if isinstance(entity, ZeekrConfigNumber)
+    ]
+    assert {(entity.unique_id, entity.native_value) for entity in config_numbers} == {
+        ("VIN1_seat_operation_duration", 12),
+        ("VIN1_ac_operation_duration", 15),
+        ("VIN1_steering_wheel_heat_duration", 8),
+        ("VIN2_seat_operation_duration", 12),
+        ("VIN2_ac_operation_duration", 15),
+        ("VIN2_steering_wheel_heat_duration", 8),
+    }
+
+
+def test_migrate_legacy_config_numbers():
+    registry = MagicMock()
+
+    registry.async_get_entity_id.side_effect = lambda _domain, _platform, unique_id: (
+        "number.seat_operation_duration"
+        if unique_id == "test_entry_seat_operation_duration"
+        else None
+    )
+
+    restored = SimpleNamespace(
+        last_states={
+            "number.seat_operation_duration": SimpleNamespace(
+                state=SimpleNamespace(state="unavailable"),
+                extra_data=SimpleNamespace(as_dict=lambda: {"native_value": 12}),
+            )
+        }
+    )
+
+    with patch(
+        "custom_components.zeekr_ev.number.er.async_get", return_value=registry
+    ), patch(
+        "custom_components.zeekr_ev.number.restore_state.async_get",
+        return_value=restored,
+    ):
+        values = _migrate_legacy_config_numbers(MagicMock(), "test_entry", "VIN1")
+
+    assert values == {"seat": 12}
+    registry.async_update_entity.assert_called_once_with(
+        "number.seat_operation_duration",
+        new_unique_id="VIN1_seat_operation_duration",
+    )

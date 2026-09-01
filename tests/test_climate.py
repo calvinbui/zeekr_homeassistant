@@ -1,6 +1,7 @@
 from unittest.mock import MagicMock, AsyncMock
 import pytest
 from homeassistant.components.climate import HVACMode
+from homeassistant.exceptions import HomeAssistantError
 from custom_components.zeekr_ev.climate import ZeekrClimate, async_setup_entry
 from custom_components.zeekr_ev.const import DOMAIN
 
@@ -18,7 +19,7 @@ class MockCoordinator:
         self.data = data
         self.vehicles = {}
         self.async_inc_invoke = AsyncMock()
-        self.ac_duration = 15
+        self.operation_durations = {vin: {"ac": 15} for vin in data}
 
     def get_vehicle_by_vin(self, vin):
         return self.vehicles.get(vin)
@@ -54,6 +55,7 @@ async def test_climate_optimistic_update():
     }
 
     coordinator = MockCoordinator(initial_data)
+    coordinator.operation_durations[vin]["ac"] = 17
     vehicle_mock = MagicMock()
     coordinator.vehicles[vin] = vehicle_mock
 
@@ -73,6 +75,10 @@ async def test_climate_optimistic_update():
     assert args[1] == "ZAF"
     assert args[2]["serviceParameters"][0]["key"] == "AC"
     assert args[2]["serviceParameters"][0]["value"] == "true"
+    assert args[2]["serviceParameters"][2] == {
+        "key": "AC.duration",
+        "value": "17",
+    }
 
     # Verify Optimistic Update
     climate_status = coordinator.data[vin]["additionalVehicleStatus"]["climateStatus"]
@@ -108,6 +114,14 @@ async def test_climate_optimistic_update():
     # Verify Delayed Refresh Task Created again
     assert climate.hass.async_create_task.call_count == 2
     climate.hass.async_create_task.call_args[0][0].close()
+
+    vehicle_mock.do_remote_control.return_value = False
+    write_count = climate.async_write_ha_state.call_count
+    with pytest.raises(HomeAssistantError, match="Failed to set climate mode"):
+        await climate.async_set_hvac_mode(HVACMode.HEAT_COOL)
+    assert climate.hvac_mode == HVACMode.OFF
+    assert climate.async_write_ha_state.call_count == write_count
+    assert climate.hass.async_create_task.call_count == 2
 
 
 @pytest.mark.asyncio

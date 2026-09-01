@@ -9,6 +9,7 @@ from typing import Any
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -158,7 +159,9 @@ class ZeekrSwitch(CoordinatorEntity[ZeekrCoordinator], SwitchEntity):
             }
         elif self.field == "steering_wheel_heat":
             service_id = "ZAF"
-            duration = getattr(self.coordinator, "steering_wheel_duration", 15)
+            duration = self.coordinator.operation_durations.get(self.vin, {}).get(
+                "wheel", 8
+            )
             setting = {
                 "serviceParameters": [
                     {
@@ -192,9 +195,11 @@ class ZeekrSwitch(CoordinatorEntity[ZeekrCoordinator], SwitchEntity):
 
         if setting:
             await self.coordinator.async_inc_invoke()
-            await self.hass.async_add_executor_job(
+            success = await self.hass.async_add_executor_job(
                 vehicle.do_remote_control, command, service_id, setting
             )
+            if self.field == "steering_wheel_heat" and not success:
+                raise HomeAssistantError(f"Failed to turn on {self._attr_name}")
 
             if self.field == "charging":
                 # Wait for backend confirmation for charging
@@ -300,9 +305,11 @@ class ZeekrSwitch(CoordinatorEntity[ZeekrCoordinator], SwitchEntity):
 
         if setting:
             await self.coordinator.async_inc_invoke()
-            await self.hass.async_add_executor_job(
+            success = await self.hass.async_add_executor_job(
                 vehicle.do_remote_control, command, service_id, setting
             )
+            if self.field == "steering_wheel_heat" and not success:
+                raise HomeAssistantError(f"Failed to turn off {self._attr_name}")
             if self.field == "charging":
                 # Wait for backend confirmation that charging has stopped — symmetric
                 # with async_turn_on. An immediate coordinator refresh can still read the

@@ -1,6 +1,7 @@
 from unittest.mock import MagicMock, AsyncMock, patch
 import asyncio
 import pytest
+from homeassistant.exceptions import HomeAssistantError
 from custom_components.zeekr_ev.switch import ZeekrSwitch, async_setup_entry
 from custom_components.zeekr_ev.const import DOMAIN
 
@@ -19,7 +20,7 @@ class MockCoordinator:
         self.vehicles = {}
         self.async_inc_invoke = AsyncMock()
         self.async_request_refresh = AsyncMock()
-        self.steering_wheel_duration = 15
+        self.operation_durations = {vin: {"wheel": 9} for vin in data}
 
     def get_vehicle_by_vin(self, vin):
         return self.vehicles.get(vin)
@@ -261,7 +262,7 @@ async def test_steering_wheel_switch():
                 },
                 {
                     "key": "SW.duration",
-                    "value": "15"
+                    "value": "9"
                 },
                 {
                     "key": "SW.level",
@@ -292,6 +293,19 @@ async def test_steering_wheel_switch():
     # Optimistic update
     assert coordinator.data[vin]["additionalVehicleStatus"]["climateStatus"]["steerWhlHeatingSts"] == "2"
     switch.async_write_ha_state.assert_called()
+
+    vehicle_mock.do_remote_control.return_value = False
+    write_count = switch.async_write_ha_state.call_count
+    with pytest.raises(HomeAssistantError, match="Failed to turn on"):
+        await switch.async_turn_on()
+    assert switch.is_on is False
+
+    climate_status = coordinator.data[vin]["additionalVehicleStatus"]["climateStatus"]
+    climate_status["steerWhlHeatingSts"] = "1"
+    with pytest.raises(HomeAssistantError, match="Failed to turn off"):
+        await switch.async_turn_off()
+    assert switch.is_on is True
+    assert switch.async_write_ha_state.call_count == write_count
 
 
 @pytest.mark.asyncio
