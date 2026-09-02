@@ -2,6 +2,10 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock, patch
 import pytest
+from homeassistant.const import Platform
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import restore_state
+from homeassistant.helpers.update_coordinator import BaseCoordinatorEntity
 
 from custom_components.zeekr_ev.number import (
     ZeekrChargingLimitNumber,
@@ -185,7 +189,7 @@ async def test_config_number():
     assert number_entity.native_value == 10
     assert number_entity.native_min_value == 1
     assert number_entity.native_max_value == 60
-    assert number_entity.device_info["identifiers"] == {("zeekr_ev", vehicle.vin)}
+    assert number_entity.device_info["identifiers"] == {(DOMAIN, vehicle.vin)}
 
     # Set value
     await number_entity.async_set_native_value(5)
@@ -195,20 +199,53 @@ async def test_config_number():
 
 
 @pytest.mark.asyncio
-async def test_config_numbers_are_created_per_vehicle():
+@pytest.mark.parametrize(
+    ("restored", "expected"),
+    [(0, 1), (999, 60), (7.0, 7)],
+    ids=["clamped-to-min", "clamped-to-max", "in-range"],
+)
+async def test_config_number_clamps_restored_value(restored, expected):
+    vehicle = MockVehicle("VIN1")
+    coordinator = MockCoordinator([vehicle])
+
+    number_entity = ZeekrConfigNumber(
+        coordinator,
+        vehicle.vin,
+        "seat_op",
+        "Seat Operation",
+        "seat",
+        15,
+    )
+    number_entity.hass = DummyHass()
+
+    # A value stored under the old 0-15 range is clamped into the new 1-60 range
+    with patch.object(
+        BaseCoordinatorEntity, "async_added_to_hass", AsyncMock()
+    ), patch.object(
+        ZeekrConfigNumber,
+        "async_get_last_number_data",
+        AsyncMock(return_value=SimpleNamespace(native_value=restored)),
+    ):
+        await number_entity.async_added_to_hass()
+
+    assert number_entity.native_value == expected
+    assert coordinator.operation_durations[vehicle.vin]["seat"] == expected
+
+
+@pytest.mark.asyncio
+async def test_config_numbers_are_created_per_vehicle(hass, mock_config_entry):
     coordinator = MockCoordinator([MockVehicle("VIN2"), MockVehicle("VIN1")])
-    hass = DummyHass()
-    entry = SimpleNamespace(entry_id="test_entry")
-    hass.data = {DOMAIN: {entry.entry_id: coordinator}}
+    hass.data[DOMAIN] = {mock_config_entry.entry_id: coordinator}
     async_add_entities = MagicMock()
 
     with patch(
         "custom_components.zeekr_ev.number._migrate_legacy_config_numbers",
         return_value={"seat": 12},
     ) as migrate:
-        await async_setup_entry(hass, entry, async_add_entities)
+        await async_setup_entry(hass, mock_config_entry, async_add_entities)
 
-    migrate.assert_called_once_with(hass, entry.entry_id, "VIN1")
+    # The lowest VIN inherits the legacy entities; every vehicle is seeded with their values
+    migrate.assert_called_once_with(hass, mock_config_entry.entry_id, "VIN1")
     config_numbers = [
         entity
         for entity in async_add_entities.call_args.args[0]
@@ -224,34 +261,124 @@ async def test_config_numbers_are_created_per_vehicle():
     }
 
 
-def test_migrate_legacy_config_numbers():
-    registry = MagicMock()
+@pytest.mark.asyncio
+async def test_config_numbers_setup_without_legacy_entities(hass, mock_config_entry):
+    coordinator = MockCoordinator([MockVehicle("VIN1")])
+    hass.data[DOMAIN] = {mock_config_entry.entry_id: coordinator}
+    async_add_entities = MagicMock()
 
+    # Unpatched: the registry seeded by conftest reports no legacy entities
+    await async_setup_entry(hass, mock_config_entry, async_add_entities)
+
+    registry = hass.data[er.DATA_REGISTRY]
+    registry.async_get_entity_id.assert_any_call(
+        Platform.NUMBER, DOMAIN, f"{mock_config_entry.entry_id}_seat_operation_duration"
+    )
+    registry.async_update_entity.assert_not_called()
+    config_numbers = [
+        entity
+        for entity in async_add_entities.call_args.args[0]
+        if isinstance(entity, ZeekrConfigNumber)
+    ]
+    assert {(entity.unique_id, entity.native_value) for entity in config_numbers} == {
+        ("VIN1_seat_operation_duration", 15),
+        ("VIN1_ac_operation_duration", 15),
+        ("VIN1_steering_wheel_heat_duration", 8),
+    }
+
+
+@pytest.mark.asyncio
+async def test_config_numbers_setup_without_vehicles(hass, mock_config_entry):
+    coordinator = MockCoordinator([])
+    hass.data[DOMAIN] = {mock_config_entry.entry_id: coordinator}
+    async_add_entities = MagicMock()
+
+    with patch(
+        "custom_components.zeekr_ev.number._migrate_legacy_config_numbers"
+    ) as migrate:
+        await async_setup_entry(hass, mock_config_entry, async_add_entities)
+
+    # Nothing to migrate or create for an account without cars
+    migrate.assert_not_called()
+    assert not any(
+        isinstance(entity, ZeekrConfigNumber)
+        for entity in async_add_entities.call_args.args[0]
+    )
+
+
+def _stored_state(native_value):
+    """Mimic the RestoreNumber StoredState of a legacy duration entity.
+
+    Only ``extra_data`` is modelled: the migration never reads ``.state``, because
+    RestoreNumber has always stored ``native_value`` in extra_data.
+    """
+    return SimpleNamespace(
+        extra_data=SimpleNamespace(as_dict=lambda: {"native_value": native_value}),
+    )
+
+
+def _legacy_seat_registry(hass):
+    """Make the seeded registry report one legacy seat duration entity."""
+    registry = hass.data[er.DATA_REGISTRY]
     registry.async_get_entity_id.side_effect = lambda _domain, _platform, unique_id: (
         "number.seat_operation_duration"
         if unique_id == "test_entry_seat_operation_duration"
         else None
     )
+    return registry
 
-    restored = SimpleNamespace(
-        last_states={
-            "number.seat_operation_duration": SimpleNamespace(
-                state=SimpleNamespace(state="unavailable"),
-                extra_data=SimpleNamespace(as_dict=lambda: {"native_value": 12}),
-            )
-        }
-    )
 
-    with patch(
-        "custom_components.zeekr_ev.number.er.async_get", return_value=registry
-    ), patch(
-        "custom_components.zeekr_ev.number.restore_state.async_get",
-        return_value=restored,
-    ):
-        values = _migrate_legacy_config_numbers(MagicMock(), "test_entry", "VIN1")
+@pytest.mark.parametrize(
+    ("stored_state", "expected"),
+    [
+        (_stored_state(12), {"seat": 12}),
+        (_stored_state(0), {"seat": 1}),
+        (_stored_state(999), {"seat": 60}),
+        (_stored_state("abc"), {}),
+        # A live state is never read on its own (see _stored_state)
+        (SimpleNamespace(state=SimpleNamespace(state="7"), extra_data=None), {}),
+        (None, {}),
+    ],
+    ids=[
+        "value",
+        "clamped-to-min",
+        "clamped-to-max",
+        "non-numeric",
+        "no-extra-data",
+        "no-restore-data",
+    ],
+)
+def test_migrate_legacy_config_numbers(hass, stored_state, expected):
+    registry = _legacy_seat_registry(hass)
+    if stored_state is not None:
+        last_states = hass.data[restore_state.DATA_RESTORE_STATE].last_states
+        last_states["number.seat_operation_duration"] = stored_state
 
-    assert values == {"seat": 12}
+    values = _migrate_legacy_config_numbers(hass, "test_entry", "VIN1")
+
+    assert values == expected
+    # The legacy entity keeps its entity_id and history under the new unique_id
     registry.async_update_entity.assert_called_once_with(
         "number.seat_operation_duration",
         new_unique_id="VIN1_seat_operation_duration",
     )
+
+
+def test_migrate_legacy_config_numbers_already_migrated(hass):
+    registry = hass.data[er.DATA_REGISTRY]
+    registry.async_get_entity_id.return_value = "number.seat_operation_duration"
+
+    values = _migrate_legacy_config_numbers(hass, "test_entry", "VIN1")
+
+    # The per-vehicle unique_ids already exist, so nothing is renamed or carried over
+    assert values == {}
+    registry.async_update_entity.assert_not_called()
+
+
+def test_migrate_legacy_config_numbers_without_legacy_entities(hass):
+    registry = hass.data[er.DATA_REGISTRY]
+
+    values = _migrate_legacy_config_numbers(hass, "test_entry", "VIN1")
+
+    assert values == {}
+    registry.async_update_entity.assert_not_called()

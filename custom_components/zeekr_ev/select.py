@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from homeassistant.components.select import SelectEntity
@@ -124,7 +125,7 @@ async def async_setup_entry(
     async_add_entities(entities)
 
 
-class ZeekrSeatSelect(CoordinatorEntity, SelectEntity):
+class ZeekrSeatSelect(CoordinatorEntity[ZeekrCoordinator], SelectEntity):
     """Zeekr Seat Select class."""
 
     _attr_has_entity_name = True
@@ -206,9 +207,7 @@ class ZeekrSeatSelect(CoordinatorEntity, SelectEntity):
             return
 
         level = OPTION_TO_LEVEL.get(option, 0)
-        duration = self.coordinator.operation_durations.get(self.vin, {}).get(
-            "seat", 15
-        )
+        duration = self.coordinator.operation_durations.get(self.vin, {}).get("seat", 15)
 
         command = "start"
         service_id = "ZAF"
@@ -241,7 +240,12 @@ class ZeekrSeatSelect(CoordinatorEntity, SelectEntity):
         self._update_local_state_optimistically(level)
         self.async_write_ha_state()
 
-        await self.coordinator.async_request_refresh()
+        # Delay the refresh: an immediate poll can still return the old level
+        # and revert the optimistic update
+        async def delayed_refresh():
+            await asyncio.sleep(10)
+            await self.coordinator.async_request_refresh()
+        self.hass.async_create_task(delayed_refresh())
 
     def _update_local_state_optimistically(self, level: int):
         """Update the coordinator data to reflect the change immediately."""

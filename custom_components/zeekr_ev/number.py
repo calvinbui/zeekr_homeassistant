@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from homeassistant.components.number import (
     NumberDeviceClass,
@@ -10,28 +11,77 @@ from homeassistant.components.number import (
     RestoreNumber,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import (
-    PERCENTAGE,
-    STATE_UNAVAILABLE,
-    STATE_UNKNOWN,
-    Platform,
-    UnitOfTime,
-)
+from homeassistant.const import PERCENTAGE, EntityCategory, Platform, UnitOfTime
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import restore_state
-from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .coordinator import ZeekrCoordinator
 from .entity import ZeekrEntity
 
+_LOGGER = logging.getLogger(__name__)
+
+# Entity key -> (name, operation_durations key, default minutes)
 CONFIG_NUMBERS = {
     "seat_operation_duration": ("Seat Operation Duration", "seat", 15),
     "ac_operation_duration": ("AC Operation Duration", "ac", 15),
     "steering_wheel_heat_duration": ("Steering Wheel Heat Duration", "wheel", 8),
 }
+
+# Operation durations are clamped to this range (minutes)
+MIN_OPERATION_DURATION = 1
+MAX_OPERATION_DURATION = 60
+
+
+def _migrate_legacy_config_numbers(
+    hass: HomeAssistant, entry_id: str, vin: str
+) -> dict[str, int]:
+    """Move the legacy account-wide duration entities onto a vehicle.
+
+    The entity IDs and their history are kept for the given VIN. The restored
+    values are returned so every vehicle can be seeded with them.
+    """
+    registry = er.async_get(hass)
+    restored_states = restore_state.async_get(hass).last_states
+    values: dict[str, int] = {}
+
+    for key, (_name, duration_key, _default_value) in CONFIG_NUMBERS.items():
+        new_unique_id = f"{vin}_{key}"
+        if registry.async_get_entity_id(Platform.NUMBER, DOMAIN, new_unique_id):
+            # Already migrated
+            continue
+
+        old_unique_id = f"{entry_id}_{key}"
+        if entity_id := registry.async_get_entity_id(
+            Platform.NUMBER, DOMAIN, old_unique_id
+        ):
+            # RestoreNumber always stores native_value in extra_data
+            stored_state = restored_states.get(entity_id)
+            native_value = None
+            if stored_state and (extra_data := stored_state.extra_data):
+                native_value = extra_data.as_dict().get("native_value")
+
+            if native_value is not None:
+                try:
+                    values[duration_key] = max(
+                        MIN_OPERATION_DURATION,
+                        min(int(float(native_value)), MAX_OPERATION_DURATION),
+                    )
+                except (TypeError, ValueError):
+                    pass
+
+            _LOGGER.debug(
+                "Migrating %s from unique_id %s to %s (seed value %s)",
+                entity_id,
+                old_unique_id,
+                new_unique_id,
+                values.get(duration_key),
+            )
+            registry.async_update_entity(entity_id, new_unique_id=new_unique_id)
+
+    return values
 
 
 async def async_setup_entry(
@@ -46,6 +96,8 @@ async def async_setup_entry(
 
     legacy_values: dict[str, int] = {}
     if coordinator.vehicles:
+        # The lowest VIN inherits the legacy account-wide entity IDs; every
+        # vehicle is seeded with the values they held.
         legacy_values = _migrate_legacy_config_numbers(
             hass,
             entry.entry_id,
@@ -69,58 +121,14 @@ async def async_setup_entry(
     async_add_entities(entities)
 
 
-def _migrate_legacy_config_numbers(
-    hass: HomeAssistant, entry_id: str, vin: str
-) -> dict[str, int]:
-    """Migrate legacy IDs and return their values to seed every vehicle."""
-    registry = er.async_get(hass)
-    restored_states = restore_state.async_get(hass).last_states
-    values: dict[str, int] = {}
-
-    for key, (_name, duration_key, _default_value) in CONFIG_NUMBERS.items():
-        new_unique_id = f"{vin}_{key}"
-        if registry.async_get_entity_id(Platform.NUMBER, DOMAIN, new_unique_id):
-            continue
-
-        old_unique_id = f"{entry_id}_{key}"
-        if entity_id := registry.async_get_entity_id(
-            Platform.NUMBER, DOMAIN, old_unique_id
-        ):
-            stored_state = restored_states.get(entity_id)
-            native_value = None
-            if stored_state and (extra_data := stored_state.extra_data):
-                native_value = extra_data.as_dict().get("native_value")
-
-            state = stored_state.state if stored_state else hass.states.get(entity_id)
-            if (
-                native_value is None
-                and state
-                and state.state
-                not in (
-                    STATE_UNKNOWN,
-                    STATE_UNAVAILABLE,
-                )
-            ):
-                native_value = state.state
-
-            if native_value is not None:
-                try:
-                    values[duration_key] = max(1, min(int(float(native_value)), 60))
-                except (TypeError, ValueError):
-                    pass
-            registry.async_update_entity(entity_id, new_unique_id=new_unique_id)
-
-    return values
-
-
 class ZeekrConfigNumber(ZeekrEntity, RestoreNumber):
     """Zeekr Configuration Number class."""
 
     _attr_has_entity_name = True
     _attr_device_class = NumberDeviceClass.DURATION
     _attr_entity_category = EntityCategory.CONFIG
-    _attr_native_min_value = 1
-    _attr_native_max_value = 60
+    _attr_native_min_value = MIN_OPERATION_DURATION
+    _attr_native_max_value = MAX_OPERATION_DURATION
     _attr_native_step = 1
     _attr_native_unit_of_measurement = UnitOfTime.MINUTES
     _attr_icon = "mdi:timer-outline"
@@ -156,7 +164,7 @@ class ZeekrConfigNumber(ZeekrEntity, RestoreNumber):
 
     async def async_set_native_value(self, value: float) -> None:
         """Set new value."""
-        self._attr_native_value = value
+        self._attr_native_value = int(value)
         self.coordinator.operation_durations[self.vin][self._duration_key] = int(value)
         self.async_write_ha_state()
 

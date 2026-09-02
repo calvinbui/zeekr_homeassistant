@@ -159,9 +159,7 @@ class ZeekrSwitch(CoordinatorEntity[ZeekrCoordinator], SwitchEntity):
             }
         elif self.field == "steering_wheel_heat":
             service_id = "ZAF"
-            duration = self.coordinator.operation_durations.get(self.vin, {}).get(
-                "wheel", 8
-            )
+            duration = self.coordinator.operation_durations.get(self.vin, {}).get("wheel", 8)
             setting = {
                 "serviceParameters": [
                     {
@@ -198,6 +196,11 @@ class ZeekrSwitch(CoordinatorEntity[ZeekrCoordinator], SwitchEntity):
             success = await self.hass.async_add_executor_job(
                 vehicle.do_remote_control, command, service_id, setting
             )
+            # Only the commands reworked to carry a per-vehicle duration (AC, seats,
+            # steering wheel) surface a rejection, so here only the steering wheel
+            # raises. Defrost and sentry mode keep their pre-existing optimistic
+            # update (extend the check if that should change); charging has its own
+            # confirmation loop below.
             if self.field == "steering_wheel_heat" and not success:
                 raise HomeAssistantError(f"Failed to turn on {self._attr_name}")
 
@@ -308,6 +311,8 @@ class ZeekrSwitch(CoordinatorEntity[ZeekrCoordinator], SwitchEntity):
             success = await self.hass.async_add_executor_job(
                 vehicle.do_remote_control, command, service_id, setting
             )
+            # See async_turn_on: only the steering wheel raises on rejection (scoped
+            # to the duration-carrying commands)
             if self.field == "steering_wheel_heat" and not success:
                 raise HomeAssistantError(f"Failed to turn off {self._attr_name}")
             if self.field == "charging":

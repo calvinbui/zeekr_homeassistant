@@ -37,7 +37,7 @@ async def async_setup_entry(
     async_add_entities(entities)
 
 
-class ZeekrClimate(CoordinatorEntity, ClimateEntity):
+class ZeekrClimate(CoordinatorEntity[ZeekrCoordinator], ClimateEntity):
     """Zeekr Climate class."""
 
     _attr_has_entity_name = True
@@ -101,9 +101,7 @@ class ZeekrClimate(CoordinatorEntity, ClimateEntity):
 
         if hvac_mode == HVACMode.HEAT_COOL:
             # Turn ON
-            duration = self.coordinator.operation_durations.get(self.vin, {}).get(
-                "ac", 15
-            )
+            duration = self.coordinator.operation_durations.get(self.vin, {}).get("ac", 15)
             setting = {
                 "serviceParameters": [
                     {
@@ -170,11 +168,19 @@ class ZeekrClimate(CoordinatorEntity, ClimateEntity):
         if (temp := kwargs.get("temperature")) is None:
             return
 
+        previous = self._target_temperature
         self._target_temperature = temp
 
         # If currently running, update the temp by sending the command again
         if self.hvac_mode == HVACMode.HEAT_COOL:
-            await self.async_set_hvac_mode(HVACMode.HEAT_COOL)
+            try:
+                await self.async_set_hvac_mode(HVACMode.HEAT_COOL)
+            except Exception:
+                # Rejected by the car, or the request itself failed: don't keep
+                # showing a target it never received (unless a newer call set one)
+                if self._target_temperature == temp:
+                    self._target_temperature = previous
+                raise
 
     @property
     def extra_state_attributes(self):
